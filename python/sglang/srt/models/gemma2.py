@@ -23,7 +23,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -211,14 +211,14 @@ class Gemma2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        self.input_layernorm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = GemmaRMSNorm(
+        self.pre_feedforward_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_feedforward_layernorm = GemmaRMSNorm(
+        self.post_feedforward_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -272,7 +272,7 @@ class Gemma2Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
         )
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Normalize the embedding by sqrt(hidden_size)
         # The normalizer's data type should be downcasted to the model's

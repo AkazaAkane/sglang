@@ -76,7 +76,7 @@ class RMSNorm(CustomOp):
             return x, residual
 
 
-class GemmaRMSNorm(CustomOp):
+class Gemma3RMSNorm(CustomOp):
     def __init__(
         self,
         hidden_size: int,

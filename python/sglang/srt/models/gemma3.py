@@ -15,16 +15,16 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gemma3.py
 
-from typing import Iterable, Optional, Set, Tuple, Dict, Any, Union
+from typing import Iterable, Optional, Set, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import AutoModel, PretrainedConfig
 
+from sglang.srt.configs.gemma3 import Gemma3Config
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -149,12 +149,12 @@ class Gemma3Attention(nn.Module):
         )
 
         # Gemma3 adds normalization for q and k
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Gemma3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         # Determine if layer uses sliding window based on pattern
         self.is_sliding = bool((layer_id + 1) % config.sliding_window_pattern)
-        
+
         # Set up RoPE parameters based on local or global attention
         if self.is_sliding:
             # Local attention
@@ -162,7 +162,7 @@ class Gemma3Attention(nn.Module):
             rope_scaling = {"rope_type": "default"}
             sliding_window = config.interleaved_sliding_window
         else:
-            # Global attention 
+            # Global attention
             self.rope_theta = config.rope_theta
             rope_scaling = config.rope_scaling
             sliding_window = None
@@ -196,22 +196,22 @@ class Gemma3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+
         # Apply normalization to q and k
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         q = self.q_norm(q)
         q = q.flatten(-2, -1)
-        
+
         k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         k = self.k_norm(k)
         k = k.flatten(-2, -1)
-        
+
         q, k = self.rotary_emb(positions, q, k)
-        
+
         # Basic implementation without image support
         # Image support with bidirectional attention would need additional code
         attn_output = self.attn(q, k, v, forward_batch)
-        
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -245,14 +245,14 @@ class Gemma3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        self.input_layernorm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = GemmaRMSNorm(
+        self.pre_feedforward_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_feedforward_layernorm = GemmaRMSNorm(
+        self.post_feedforward_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -309,7 +309,7 @@ class Gemma3Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
         )
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Normalize the embedding by sqrt(hidden_size)
         # The normalizer's data type should be downcasted to the model's
@@ -412,7 +412,9 @@ class Gemma3ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds, **kwargs)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, **kwargs
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
@@ -494,3 +496,6 @@ class Gemma3ForCausalLM(nn.Module):
 
 
 EntryClass = Gemma3ForCausalLM
+
+print("registering")
+AutoModel.register(Gemma3Config, Gemma3ForCausalLM, exist_ok=True)

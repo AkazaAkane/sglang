@@ -19,6 +19,7 @@ import dataclasses
 from enum import IntEnum, auto
 from typing import Dict, List, Optional, Tuple, Union
 
+from sglang.lang.chat_template import ChatTemplateStyle
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 
 
@@ -601,6 +602,26 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
         stop_str=["<|im_end|>"],
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
+    )
+)
+
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
+register_conv_template(
+    Conversation(
+        name="gemma-it",
+        system_message="You are a helpful assistant.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        # role_prefix_and_suffix={
+        #     "system": ("", ""),
+        #     "user": ("<start_of_turn>user\n", "<end_of_turn>\n"),
+        #     "assistant": ("<start_of_turn>model\n", "<end_of_turn>\n"),
+        # },
+        # style=ChatTemplateStyle.PLAIN,
+        image_token="<image_soft_token>",
     )
 )
 
