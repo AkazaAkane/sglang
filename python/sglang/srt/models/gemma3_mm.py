@@ -204,7 +204,7 @@ class Gemma3MultiModalProjector(nn.Module):
         self.patches_per_image = int(
             config.vision_config.image_size // config.vision_config.patch_size
         )
-        self.tokens_per_side = int(config.mm_tokens_per_image ** 0.5)
+        self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
         self.kernel_size = self.patches_per_image // self.tokens_per_side
         self.avg_pool = nn.AvgPool2d(
             kernel_size=self.kernel_size, stride=self.kernel_size
@@ -308,7 +308,9 @@ class Gemma3ForConditionalGeneration(nn.Module):
         self.language_model = Gemma3ForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        self.pad_token_id = (
+            self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        )
         # self.post_init()
         self.logits_processor = LogitsProcessor(config.text_config)
 
@@ -495,10 +497,7 @@ class Gemma3ForConditionalGeneration(nn.Module):
             image_inputs = [
                 img for img in forward_batch.image_inputs if img is not None
             ]
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and len(image_inputs) != 0
-        ):
+        if not forward_batch.forward_mode.is_decode() and len(image_inputs) != 0:
             image_input: ImageInputs = image_inputs[0]
             image_features = self.get_image_features(image_input.pixel_values)
 
@@ -543,7 +542,7 @@ class Gemma3ForConditionalGeneration(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
             inputs_embeds=inputs_embeds,
-            get_embedding=get_embedding
+            get_embedding=get_embedding,
         )
 
         return outputs
@@ -601,8 +600,8 @@ class Gemma3ForConditionalGeneration(nn.Module):
                     left_idx = start_idx + (image_offset - prefix_len + 1)
                     right_idx = left_idx + num_image_tokens
                     inputs_embeds[left_idx:right_idx] = image_embeds[
-                                                        image_embeds_offset: image_embeds_offset + num_image_tokens
-                                                        ]
+                        image_embeds_offset : image_embeds_offset + num_image_tokens
+                    ]
                     image_embeds_offset += num_image_tokens
 
             # Prepare attention masks for multimodal inputs
