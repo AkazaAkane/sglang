@@ -233,10 +233,6 @@ class Gemma3TextConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         rope_config_validation(self)
 
-        print(f"1 text config: {self.eos_token_id}")
-        print(f"2 text config: {self.bos_token_id}")
-        print(f"3 text config: {self.pad_token_id}")
-
 
 class Gemma3Config(PretrainedConfig):
     r"""

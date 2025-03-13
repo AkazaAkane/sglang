@@ -16,12 +16,20 @@ from typing import Iterable, Optional, Set, Tuple
 
 import einops
 import torch
+import torch.nn.functional as F
+from einops import rearrange
 from torch import nn
-from transformers import ROPE_INIT_FUNCTIONS, PretrainedConfig, AutoModel
+from transformers import (
+    ROPE_INIT_FUNCTIONS,
+    AutoModel,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 
 from sglang.srt.configs.gemma3 import Gemma3TextConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.attention.vision import rotate_half
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -32,12 +40,13 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, logger, make_layers
 
 
 # Adapted from:
@@ -96,6 +105,36 @@ class Gemma3MLP(nn.Module):
         return x
 
 
+first = True
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 class Gemma3Attention(nn.Module):
     def __init__(
         self,
@@ -128,7 +167,9 @@ class Gemma3Attention(nn.Module):
 
         hidden_size = config.hidden_size
 
-        head_dim = getattr(config, "head_dim", hidden_size // config.num_attention_heads)
+        head_dim = getattr(
+            config, "head_dim", hidden_size // config.num_attention_heads
+        )
         self.head_dim = head_dim
 
         # print(f"head_dim: {head_dim}")
@@ -158,35 +199,42 @@ class Gemma3Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Gemma3 adds normalization for q and k
-        self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
-
         # Determine if layer uses sliding window based on pattern
         # self.is_sliding = bool((layer_id + 1) % config.sliding_window_pattern)
-        self.is_sliding = config.sliding_window is not None
-
-        # Set up RoPE parameters based on local or global attention
+        self.is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
+        # Initialize the rotary embedding.
         if self.is_sliding:
-            # Local attention
+            # Local attention. Override the values in config.json.
             self.rope_theta = config.rope_local_base_freq
-            rope_scaling = {"rope_type": "default"}
-            sliding_window = config.sliding_window
+            self.rope_scaling = {"rope_type": "default"}
+            self.sliding_window = config.interleaved_sliding_window
         else:
-            # Global attention
+            # Global attention. Use the values in config.json.
             self.rope_theta = config.rope_theta
-            rope_scaling = config.rope_scaling
-            sliding_window = None
+            self.rope_scaling = config.rope_scaling
+            self.sliding_window = None
+        # self.rotary_emb = get_rope(
+        #     self.head_dim,
+        #     rotary_dim=self.head_dim,
+        #     max_position=max_position_embeddings,
+        #     base=self.rope_theta,
+        #     is_neox_style=True,
+        #     rope_scaling=rope_scaling,
+        # )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=self.rope_theta,
-            is_neox_style=True,
-            rope_scaling=rope_scaling,
-        )
-
+        use_naive_attn = True
+        self.use_naive_attn = use_naive_attn
+        # if use_naive_attn:
+        #     self.q_proj = nn.Linear(
+        #         config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        #     )
+        #     self.k_proj = nn.Linear(
+        #         config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        #     )
+        #     self.v_proj = nn.Linear(
+        #         config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        #     )
+        # else:
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -194,9 +242,72 @@ class Gemma3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             logit_cap=getattr(self.config, "attn_logit_softcapping", None),
-            sliding_window_size=sliding_window,
+            sliding_window_size=self.sliding_window,
             prefix=add_prefix("attn", prefix),
         )
+
+        # Gemma3 adds normalization for q and k
+        self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        # TODO(woosuk): Add reference to the original HF implementation.
+        layer_idx = extract_layer_index(prefix)
+
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=self.rope_theta,
+            is_neox_style=True,
+            rope_scaling=self.rope_scaling,
+        )
+
+    def naive_attn_with_masks(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        # NOTE(woosuk): As described in the comment above, this code is not
+        # meant to be performant. It is only meant to be correct.
+        q = q.view(-1, self.num_heads, self.head_dim)
+        # Expand the key and value to handle GQA.
+        num_queries_per_kv = self.num_heads // self.num_kv_heads
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        k = k.repeat_interleave(num_queries_per_kv, dim=-2)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.repeat_interleave(num_queries_per_kv, dim=-2)
+
+        if self.is_sliding:
+            attn_masks = kwargs["local_attn_masks"]
+        else:
+            attn_masks = kwargs["global_attn_masks"]
+
+        seq_lens = kwargs["seq_lens"]
+        start_idx = 0
+        for seq_len, attn_mask in zip(seq_lens, attn_masks):
+            end_idx = start_idx + seq_len
+            query = q[start_idx:end_idx].unsqueeze(0)
+            key = k[start_idx:end_idx].unsqueeze(0)
+            value = v[start_idx:end_idx].unsqueeze(0)
+
+            # Transpose.
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+
+            output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask,
+                self.scaling,
+            )
+            output = output.transpose(1, 2).flatten(-2, -1)
+            out[start_idx:end_idx] = output
+            start_idx = end_idx
+        return out
 
     def forward(
         self,
@@ -206,34 +317,79 @@ class Gemma3Attention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> torch.Tensor:
+        #
+        # qkv, _ = self.qkv_proj(hidden_states)
+        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # s = q.shape[0]
+        # # [ s, ( h * d ) ] -> [ s, h, d ]
+        # q = rearrange(q, "s (h d) -> s h d", d=self.head_dim).contiguous()
+        # q = self.q_norm(q)
+        # # [ s, ( h_q * d ) ] -> [ 1, s, h_q, d ]
+        # q = rearrange(q, "s h d -> 1 h s d")
+        #
+        # # [ s, ( h * d ) ] -> [ s, h, d ]
+        # k = rearrange(k, "s (h d) -> s h d", d=self.head_dim).contiguous()
+        # k = self.k_norm(k)
+        # # [ s, ( h_kv * d ) ] -> [ s, h_kv, d ]
+        # k = rearrange(k, "s h d -> 1 h s d")
+        #
+        # # cos, sin = position_embeddings
+        # # q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        #
+        # q = q.reshape(1, self.num_heads, s, self.head_dim)
+        # k = k.reshape(1, self.num_kv_heads, s, self.head_dim)
+        # v = v.reshape(1, self.num_kv_heads, s, self.head_dim)
+        #
+        # # q, k = self.rotary_emb(positions, q, k)
+        #
+        # cos, sin = position_embeddings
+        # print(f"q shape {q.shape}")
+        # print(f"cos shape {cos.shape}")
+        # print(f"sin shape {sin.shape}")
+        # print(f"k shape {k.shape}")
+        # q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        #
+        # global first
+        # if first and len(positions) >= 15:
+        #     print(f"before first attn")
+        #     print(f"q shape: {q.shape}")
+        #     print(f"k shape: {k.shape}")
+        #     print(f"q: {q}")
+        #     print(f"k: {k}")
+        #
+        # q = q.reshape(-1, self.num_heads, self.head_dim)
+        # k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        # v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        #
+        # attn_output = self.attn(q, k, v, forward_batch)
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Apply normalization to q and k
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = q.contiguous()
-        # [ s, num_heads, head_dim ]
         q = self.q_norm(q)
-        # [ 1, heads, s, head_dim]
-        q = q.reshape(-1, self.num_heads, q.shape[0], self.head_dim)
-
+        q = q.flatten(-2, -1)
         k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-        k = k.contiguous()
-        # [ s, kv_heads, head_dim ]
         k = self.k_norm(k)
-        k = einops.rearrange(k, "s head hd -> 1 head s hd")
-
-        # cos, sin = position_embeddings
-        # q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        k = k.flatten(-2, -1)
 
         q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch=forward_batch)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        # print(f"q shape {q.shape}")
+        # print(f"k shape {k.shape}")
 
+        if not kwargs.get("has_images", False):
+            # Fast path for text-only inputs. The performance for the text-only
+            # inputs are not affected by the naive attention below.
+            output, _ = self.o_proj(attn_output)
+            return output
+
+        attn_output = self.naive_attn_with_masks(q, k, v, out=attn_output, **kwargs)
+        # if first:
+        #     print(f"aatn_oout: {attn_output}")
+        #     print(f"attn_output shape: {attn_output.shape}")
+        #     first = False
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -275,6 +431,7 @@ class Gemma3DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.is_sliding = self.self_attn.is_sliding
 
     def forward(
         self,
@@ -295,6 +452,7 @@ class Gemma3DecoderLayer(nn.Module):
             position_embeddings = position_embeddings_local
         else:
             position_embeddings = position_embeddings_global
+        # print(f"outputs 0000: {hidden_states}")
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -303,6 +461,7 @@ class Gemma3DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             **kwargs,
         )
+        # print(f"outputs 11111: {hidden_states}")
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -313,6 +472,8 @@ class Gemma3DecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
+
+        # print(f"outputs 2222: {outputs}")
         return outputs
 
 
@@ -413,14 +574,14 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
         return super().forward(input_ids) * self.embed_scale
 
 
-class Gemma3TextModel(nn.Module):
+class Gemma3TextModel(PreTrainedModel):
     def __init__(
         self,
         config: Gemma3TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
 
@@ -461,6 +622,7 @@ class Gemma3TextModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_init()
 
     def forward(
         self,
@@ -475,14 +637,15 @@ class Gemma3TextModel(nn.Module):
         else:
             hidden_states = input_embeds
 
-        positions = einops.rearrange(positions, "s -> 1 s")
+        # print(f"positions: {positions}")
+        if len(positions.shape) == 1:
+            positions = einops.rearrange(positions, "s -> 1 s")
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings_global = self.rotary_emb(hidden_states, positions)
         position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
 
-        for i in range(min(self.config.num_hidden_layers, len(self.layers))):
-            layer = self.layers[i]
+        for layer in self.layers:
             layer_outputs = layer(
                 positions=positions,
                 position_embeddings_global=position_embeddings_global,
@@ -492,11 +655,20 @@ class Gemma3TextModel(nn.Module):
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
+
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
-class Gemma3ForCausalLM(nn.Module):
+class Gemma3ForCausalLM(PreTrainedModel):
+    config_class = Gemma3TextConfig
+
+    _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    config_class = Gemma3TextConfig
+    base_model_prefix = "language_model"
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -546,13 +718,25 @@ class Gemma3ForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        super().__init__(config=config)
+        print(f"text_config: {config}")
         self.config = config
         self.quant_config = quant_config
         self.model = Gemma3TextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.logits_processor = LogitsProcessor(config)
+
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+            )
+        self.post_init()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -580,7 +764,12 @@ class Gemma3ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> LogitsProcessor:
+
+        print(f"input_ids: {input_ids}")
+        # print(f"positions: {positions}")
+        print(f"input_embeds: {input_embeds}")
+
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, **kwargs
         )
@@ -662,6 +851,12 @@ class Gemma3ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        unloaded_params = params_dict.keys() - loaded_params
+        if unloaded_params:
+            logger.warning(
+                "Some weights are not initialized from checkpoints: %s", unloaded_params
+            )
+        return loaded_params
 
 
 EntryClass = Gemma3ForCausalLM

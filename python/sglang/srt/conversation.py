@@ -297,8 +297,8 @@ class Conversation:
                         ret += role + message + self.sep
                 else:
                     ret += role
+            print(f"prompt: {ret}")
             return ret
-
 
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -326,7 +326,7 @@ class Conversation:
     def to_gradio_chatbot(self):
         """Convert the conversation to gradio chatbot format."""
         ret = []
-        for i, (role, msg) in enumerate(self.messages[self.offset:]):
+        for i, (role, msg) in enumerate(self.messages[self.offset :]):
             if i % 2 == 0:
                 ret.append([msg, None])
             else:
@@ -340,7 +340,7 @@ class Conversation:
         else:
             ret = [{"role": "system", "content": self.system_message}]
 
-        for i, (_, msg) in enumerate(self.messages[self.offset:]):
+        for i, (_, msg) in enumerate(self.messages[self.offset :]):
             if i % 2 == 0:
                 ret.append({"role": "user", "content": msg})
             else:
@@ -562,7 +562,7 @@ register_conv_template(
     Conversation(
         name="vicuna_v1.1",
         system_message="A chat between a curious user and an artificial intelligence assistant. "
-                       "The assistant gives helpful, detailed, and polite answers to the user's questions.",
+        "The assistant gives helpful, detailed, and polite answers to the user's questions.",
         roles=("USER", "ASSISTANT"),
         sep_style=SeparatorStyle.ADD_COLON_TWO,
         sep=" ",
@@ -625,7 +625,7 @@ register_conv_template(
         name="gemma-it",
         system_message="You are a helpful assistant.",
         system_template="<bos><start_of_turn>user\n{system_message}\n\n",
-        roles=("<start_of_turn>user", "<start_of_turn>model"),
+        roles=("<start_of_turn>user", "<start_of_turn>model\n"),
         sep="<end_of_turn>\n",
         sep_style=SeparatorStyle.GEMMA3,
         stop_str=["<end_of_turn>"],
