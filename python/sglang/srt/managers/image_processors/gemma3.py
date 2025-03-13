@@ -9,22 +9,13 @@ from sglang.srt.managers.image_processors.base_image_processor import (
     get_global_processor,
 )
 from sglang.srt.models.gemma3 import Gemma3ForCausalLM
+from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 
 
 class Gemma3ImageProcessor(BaseImageProcessor):
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
-        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.image_token_id = hf_config.image_token_id
-        self.video_token_id = hf_config.video_token_id
-        self.NUM_TOKEN_PER_FRAME = 770
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_RATIO = 200
+        self.IMAGE_TOKEN = "<image_soft_token"
 
     @staticmethod
     def _process_images_task(images, input_text, _hf_config):
@@ -94,5 +85,5 @@ class Gemma3ImageProcessor(BaseImageProcessor):
 
 
 ImageProcessorMapping = {
-    Gemma3ForCausalLM: Gemma3ImageProcessor,
+    Gemma3ForConditionalGeneration: Gemma3ImageProcessor,
 }

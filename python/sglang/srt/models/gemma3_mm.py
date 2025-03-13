@@ -17,12 +17,14 @@
 
 import logging
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
+from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, AutoModel, SiglipModel
+from transformers.utils import is_torchdynamo_compiling
 
+from sglang.srt.configs import Gemma3Config
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
@@ -38,7 +40,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.gemma3 import Gemma3Model
+from sglang.srt.models.gemma3 import Gemma3ForCausalLM
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,7 @@ class SiglipVisionModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
+        self.model = SiglipModel()
         super().__init__()
         self.config = vision_config
         self.embed_dim = vision_config.hidden_size
@@ -189,7 +192,9 @@ class Gemma3MultiModalProjector(nn.Module):
         super().__init__()
 
         self.mm_input_projection_weight = nn.Parameter(
-            torch.zeros(config.vision_config.hidden_size, config.text_config.hidden_size)
+            torch.zeros(
+                config.vision_config.hidden_size, config.text_config.hidden_size
+            )
         )
 
         self.mm_soft_emb_norm = Gemma3RMSNorm(
@@ -280,7 +285,7 @@ class Gemma3ForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Gemma3Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -289,16 +294,18 @@ class Gemma3ForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
 
         # Vision components
-        self.vision_tower = SiglipVisionModel(
-            config.vision_config,
-            quant_config,
-            prefix=add_prefix("vision_tower", prefix),
-        )
+        # self.vision_tower = SiglipVisionModel(
+        #     config.vision_config,
+        #     quant_config,
+        #     prefix=add_prefix("vision_tower", prefix),
+        # )
+
+        self.vision_tower = AutoModel.from_config(config=config.vision_config)
 
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
 
         # Text model
-        self.model = Gemma3Model(
+        self.language_model = Gemma3ForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
 
@@ -395,8 +402,165 @@ class Gemma3ForConditionalGeneration(nn.Module):
         kwargs["local_attn_masks"] = local_attn_masks
         return kwargs
 
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.language_model.set_input_embeddings(value)
+
+    def get_output_embeddings(self):
+        return self.language_model.get_output_embeddings()
+
+    def set_output_embeddings(self, new_embeddings):
+        self.language_model.set_output_embeddings(new_embeddings)
+
+    def set_decoder(self, decoder):
+        self.language_model.set_decoder(decoder)
+
+    def get_decoder(self):
+        return self.language_model.get_decoder()
+
+    def get_image_features(self, pixel_values: torch.Tensor):
+        """
+        Projects the last hidden state from the vision model into language model space.
+
+        Args:
+            pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
+               The tensors corresponding to the input images.
+        Returns:
+            image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
+        """
+        vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
+        image_features = self.multi_modal_projector(vision_outputs)
+        return image_features
+
     @torch.no_grad()
     def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        pixel_values: torch.FloatTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[List[torch.FloatTensor]]] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **lm_kwargs,
+    ) -> torch.Tensor:
+        r"""
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.text_config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.text_config.vocab_size]`.
+
+            logits_to_keep (`int` or `torch.Tensor`, *optional*):
+                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
+                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
+                This is useful when using packed tensor format (single dimension for batch and sequence length).
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from PIL import Image
+        >>> import requests
+        >>> from transformers import AutoProcessor, Gemma3ForConditionalGeneration
+
+        >>> model = Gemma3ForConditionalGeneration.from_pretrained("google/Gemma3-test-224px-hf")
+        >>> processor = AutoProcessor.from_pretrained("google/Gemma3-test-224px-hf")
+
+        >>> prompt = "answer en Where is the cow standing?"
+        >>> url = "https://huggingface.co/gv-hf/Gemma3-test-224px-hf/resolve/main/cow_beach_1.png"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> inputs = processor(images=image, text=prompt,  return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(**inputs, max_length=30)
+        >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "answer en Where is the cow standing?\nbeach"
+        ```"""
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Replace image id woth PAD if the image token if OOV, to avoid index-errors
+        if input_ids is not None and self.config.image_token_index >= self.vocab_size:
+            special_image_mask = input_ids == self.config.image_token_index
+            llm_input_ids = input_ids.clone()
+            llm_input_ids[special_image_mask] = 0
+        else:
+            llm_input_ids = input_ids
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(llm_input_ids)
+
+        # Merge text and images
+        if pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
+
+            if input_ids is None:
+                special_image_mask = inputs_embeds == self.get_input_embeddings()(
+                    torch.tensor(self.config.image_token_index, dtype=torch.long, device=inputs_embeds.device)
+                )
+            else:
+                special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
+                special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+
+            if not is_torchdynamo_compiling() and inputs_embeds[special_image_mask].numel() != image_features.numel():
+                image_tokens_in_text = (special_image_mask).sum(dim=1).sum(dim=0)[0]
+                raise ValueError(
+                    f"Number of images does not match number of special image tokens in the input text. "
+                    f"Got {image_tokens_in_text} image tokens in the text but {image_features.shape[0] * image_features.shape[1]} "
+                    "tokens from image embeddings."
+                )
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+
+        # mask out pad-token-ids in labels for BC
+        if labels is not None and self.pad_token_id in labels:
+            logger.warning(
+                "`labels` contains `pad_token_id` which will be masked with `config.ignore_index`. "
+                "You have to mask out `pad_token_id` when preparing `labels`, this behavior will be removed in v.4.46.",
+            )
+            labels = torch.where(input_ids == self.pad_token_id, self.config.ignore_index, labels)
+
+        causal_mask = self._update_causal_mask(
+            attention_mask, token_type_ids, past_key_values, cache_position, inputs_embeds, is_training=False
+        )
+        outputs = self.language_model(
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            logits_to_keep=logits_to_keep,
+            **lm_kwargs,
+        )
+
+        return outputs
+
+    @torch.no_grad()
+    def forwardaa(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -416,12 +580,12 @@ class Gemma3ForConditionalGeneration(nn.Module):
             or image_inputs is None
             or len(image_inputs) == 0
         ):
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = self.language_model.embed_tokens(input_ids)
         else:
             # Clamp input ids to valid range
             input_ids.clamp_(min=0, max=self.config.text_config.vocab_size - 1)
 
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = self.language_model.embed_tokens(input_ids)
             extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
             prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
@@ -459,7 +623,7 @@ class Gemma3ForConditionalGeneration(nn.Module):
             input_ids = None
 
         # Forward through the language model
-        hidden_states = self.model(
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
@@ -469,7 +633,7 @@ class Gemma3ForConditionalGeneration(nn.Module):
 
         # Process logits
         return self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens, forward_batch
+            input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -486,11 +650,17 @@ class Gemma3ForConditionalGeneration(nn.Module):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            # print(name)
+
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
 
-                name = name.replace(shard_name, param_name)
+                if "vision" in name:
+                    continue
+                else:
+                    # TODO: vision attention not adapted for now
+                    name = name.replace(shard_name, param_name)
                 # Skip loading extra bias for GPTQ models
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -521,3 +691,6 @@ class Gemma3ForConditionalGeneration(nn.Module):
 
 
 EntryClass = Gemma3ForConditionalGeneration
+
+print("registering Gemma3ForConditionalGeneration")
+AutoModel.register(Gemma3Config, Gemma3ForConditionalGeneration, exist_ok=True)

@@ -211,7 +211,9 @@ class Gemma2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Gemma3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.post_attention_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )

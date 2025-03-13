@@ -19,9 +19,9 @@ from typing import Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers import AutoModel, PretrainedConfig
+from transformers import PretrainedConfig
 
-from sglang.srt.configs.gemma3 import Gemma3Config
+from sglang.srt.configs.gemma3 import Gemma3TextConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
@@ -99,7 +99,7 @@ class Gemma3Attention(nn.Module):
     def __init__(
         self,
         layer_id: int,
-        config: PretrainedConfig,
+        config: Gemma3TextConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -129,7 +129,7 @@ class Gemma3Attention(nn.Module):
         self.head_dim = head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = config.query_pre_attn_scalar**-0.5
+        self.scaling = config.query_pre_attn_scalar ** -0.5
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -160,7 +160,7 @@ class Gemma3Attention(nn.Module):
             # Local attention
             self.rope_theta = config.rope_local_base_freq
             rope_scaling = {"rope_type": "default"}
-            sliding_window = config.interleaved_sliding_window
+            sliding_window = config.sliding_window
         else:
             # Global attention
             self.rope_theta = config.rope_theta
@@ -245,7 +245,9 @@ class Gemma3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Gemma3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.post_attention_layernorm = Gemma3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -314,7 +316,7 @@ class Gemma3Model(nn.Module):
         # Normalize the embedding by sqrt(hidden_size)
         # The normalizer's data type should be downcasted to the model's
         # data type such as bfloat16, not float32.
-        normalizer = self.config.hidden_size**0.5
+        normalizer = self.config.hidden_size ** 0.5
         self.register_buffer("normalizer", torch.tensor(normalizer))
 
     def forward(
@@ -391,7 +393,7 @@ class Gemma3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Gemma3TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -463,6 +465,7 @@ class Gemma3ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        print(f"model params: {params_dict.keys()}")
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             for param_name, shard_name, shard_id in stacked_params_mapping:
@@ -496,6 +499,3 @@ class Gemma3ForCausalLM(nn.Module):
 
 
 EntryClass = Gemma3ForCausalLM
-
-print("registering")
-AutoModel.register(Gemma3Config, Gemma3ForCausalLM, exist_ok=True)

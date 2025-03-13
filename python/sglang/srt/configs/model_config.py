@@ -429,7 +429,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaMistralForCausalLM",
     "LlavaVidForCausalLM",
-    "Gemma3ForCausalLM",
+    "Gemma3ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "MllamaForConditionalGeneration",
