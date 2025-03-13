@@ -17,11 +17,11 @@
 
 import logging
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig, AutoModel, SiglipModel
+from transformers import AutoModel, PretrainedConfig, SiglipModel
 from transformers.utils import is_torchdynamo_compiling
 
 from sglang.srt.configs import Gemma3Config
@@ -211,7 +211,7 @@ class Gemma3MultiModalProjector(nn.Module):
         )
 
     def forward(self, vision_outputs: torch.Tensor) -> torch.Tensor:
-        print("multi modal embeding...")
+        print("multi modal embedding...")
         batch_size, seq_length, hidden_size = vision_outputs.shape
 
         # Reshape for pooling
@@ -290,9 +290,6 @@ class Gemma3ForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = config
-        self.quant_config = quant_config
-
         # Vision components
         # self.vision_tower = SiglipVisionModel(
         #     config.vision_config,
@@ -301,14 +298,18 @@ class Gemma3ForConditionalGeneration(nn.Module):
         # )
 
         self.vision_tower = AutoModel.from_config(config=config.vision_config)
-
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
+        self.vocab_size = config.text_config.vocab_size
+
+        self.config = config
+        self.quant_config = quant_config
 
         # Text model
         self.language_model = Gemma3ForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
-
+        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        # self.post_init()
         self.logits_processor = LogitsProcessor(config.text_config)
 
     def calculate_num_image_tokens(self, image_grid_thw: Tuple[int, int, int]) -> int:
@@ -437,21 +438,10 @@ class Gemma3ForConditionalGeneration(nn.Module):
     @torch.no_grad()
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        pixel_values: torch.FloatTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[List[torch.FloatTensor]]] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        **lm_kwargs,
+        input_ids: torch.LongTensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
     ) -> torch.Tensor:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -490,15 +480,6 @@ class Gemma3ForConditionalGeneration(nn.Module):
         "answer en Where is the cow standing?\nbeach"
         ```"""
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         # Replace image id woth PAD if the image token if OOV, to avoid index-errors
         if input_ids is not None and self.config.image_token_index >= self.vocab_size:
             special_image_mask = input_ids == self.config.image_token_index
@@ -507,54 +488,62 @@ class Gemma3ForConditionalGeneration(nn.Module):
         else:
             llm_input_ids = input_ids
 
-        if inputs_embeds is None:
-            inputs_embeds = self.get_input_embeddings()(llm_input_ids)
+        inputs_embeds = self.get_input_embeddings()(llm_input_ids)
 
-        # Merge text and images
-        if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
+        image_inputs = []
+        if forward_batch.image_inputs is not None:
+            image_inputs = [
+                img for img in forward_batch.image_inputs if img is not None
+            ]
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and len(image_inputs) != 0
+        ):
+            image_input: ImageInputs = image_inputs[0]
+            image_features = self.get_image_features(image_input.pixel_values)
+
+            input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
 
             if input_ids is None:
                 special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                    torch.tensor(self.config.image_token_index, dtype=torch.long, device=inputs_embeds.device)
+                    torch.tensor(
+                        self.config.image_token_index,
+                        dtype=torch.long,
+                        device=inputs_embeds.device,
+                    )
                 )
             else:
-                special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
-                special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+                special_image_mask = (
+                    input_ids == self.config.image_token_index
+                ).unsqueeze(-1)
+                special_image_mask = special_image_mask.expand_as(inputs_embeds).to(
+                    inputs_embeds.device
+                )
 
-            if not is_torchdynamo_compiling() and inputs_embeds[special_image_mask].numel() != image_features.numel():
+            if (
+                not is_torchdynamo_compiling()
+                and inputs_embeds[special_image_mask].numel() != image_features.numel()
+            ):
                 image_tokens_in_text = (special_image_mask).sum(dim=1).sum(dim=0)[0]
                 raise ValueError(
                     f"Number of images does not match number of special image tokens in the input text. "
                     f"Got {image_tokens_in_text} image tokens in the text but {image_features.shape[0] * image_features.shape[1]} "
                     "tokens from image embeddings."
                 )
-            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
-
-        # mask out pad-token-ids in labels for BC
-        if labels is not None and self.pad_token_id in labels:
-            logger.warning(
-                "`labels` contains `pad_token_id` which will be masked with `config.ignore_index`. "
-                "You have to mask out `pad_token_id` when preparing `labels`, this behavior will be removed in v.4.46.",
+            image_features = image_features.to(
+                inputs_embeds.device, inputs_embeds.dtype
             )
-            labels = torch.where(input_ids == self.pad_token_id, self.config.ignore_index, labels)
+            inputs_embeds = inputs_embeds.masked_scatter(
+                special_image_mask, image_features
+            )
+            input_ids = None
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, token_type_ids, past_key_values, cache_position, inputs_embeds, is_training=False
-        )
         outputs = self.language_model(
-            attention_mask=causal_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            logits_to_keep=logits_to_keep,
-            **lm_kwargs,
+            get_embedding=get_embedding
         )
 
         return outputs
@@ -650,8 +639,6 @@ class Gemma3ForConditionalGeneration(nn.Module):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
-            # print(name)
-
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue

@@ -539,6 +539,7 @@ class TestJanusProServer(TestOpenAIVisionServer):
 class TestGemma3Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
+        cls.model = "google/gemma-3-4b-it"
         cls.model = "google/gemma-3-1b-it"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
