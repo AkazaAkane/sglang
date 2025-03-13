@@ -17,8 +17,7 @@ from typing import Iterable, Optional, Set, Tuple
 import einops
 import torch
 from torch import nn
-from transformers import ROPE_INIT_FUNCTIONS, PretrainedConfig
-from transformers.models.gemma2.modeling_gemma2 import apply_rotary_pos_emb
+from transformers import ROPE_INIT_FUNCTIONS, PretrainedConfig, AutoModel
 
 from sglang.srt.configs.gemma3 import Gemma3TextConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -39,6 +38,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, make_layers
+
 
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gemma3.py
@@ -101,10 +101,6 @@ class Gemma3Attention(nn.Module):
         self,
         layer_id: int,
         config: Gemma3TextConfig,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
         max_position_embeddings: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -112,12 +108,15 @@ class Gemma3Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.config = config
-        self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = num_heads
+
+        self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
+        self.total_num_kv_heads = config.num_key_value_heads
+
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -126,11 +125,21 @@ class Gemma3Attention(nn.Module):
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+
+        hidden_size = config.hidden_size
+
+        head_dim = getattr(config, "head_dim", hidden_size // config.num_attention_heads)
         self.head_dim = head_dim
+
+        # print(f"head_dim: {head_dim}")
+        # print(f"total_num_heads: {self.total_num_heads}")
+
         self.q_size = self.num_heads * self.head_dim
+        # print(f"q head: {self.num_heads}")
+        # print(f"kv_size head: {self.num_kv_heads}")
+
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = config.query_pre_attn_scalar**-0.5
+        self.scaling = config.query_pre_attn_scalar ** -0.5
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -150,11 +159,12 @@ class Gemma3Attention(nn.Module):
         )
 
         # Gemma3 adds normalization for q and k
-        self.q_norm = Gemma3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Gemma3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
 
         # Determine if layer uses sliding window based on pattern
-        self.is_sliding = bool((layer_id + 1) % config.sliding_window_pattern)
+        # self.is_sliding = bool((layer_id + 1) % config.sliding_window_pattern)
+        self.is_sliding = config.sliding_window is not None
 
         # Set up RoPE parameters based on local or global attention
         if self.is_sliding:
@@ -196,9 +206,6 @@ class Gemma3Attention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> torch.Tensor:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -208,7 +215,7 @@ class Gemma3Attention(nn.Module):
         # [ s, num_heads, head_dim ]
         q = self.q_norm(q)
         # [ 1, heads, s, head_dim]
-        q = einops.rearrange(q, "s head hd -> 1 head s hd")
+        q = q.reshape(-1, self.num_heads, q.shape[0], self.head_dim)
 
         k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         k = k.contiguous()
@@ -216,11 +223,15 @@ class Gemma3Attention(nn.Module):
         k = self.k_norm(k)
         k = einops.rearrange(k, "s head hd -> 1 head s hd")
 
-        cos, sin = position_embeddings
+        # cos, sin = position_embeddings
+        # q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q = q.reshape(-1, self.num_heads, self.head_dim)
+        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
-        # Image support with bidirectional attention would need additional code
+        q, k = self.rotary_emb(positions, q, k)
+
         attn_output = self.attn(q, k, v, forward_batch)
 
         output, _ = self.o_proj(attn_output)
@@ -240,10 +251,6 @@ class Gemma3DecoderLayer(nn.Module):
         self.self_attn = Gemma3Attention(
             layer_id=layer_id,
             config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
@@ -276,16 +283,12 @@ class Gemma3DecoderLayer(nn.Module):
         position_embeddings_global: torch.Tensor,
         position_embeddings_local: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         **kwargs,
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
@@ -433,7 +436,7 @@ class Gemma3TextModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             self.padding_idx,
-            embed_scale=self.config.hidden_size**0.5,
+            embed_scale=self.config.hidden_size ** 0.5,
         )
 
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -459,12 +462,6 @@ class Gemma3TextModel(nn.Module):
         )
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Normalize the embedding by sqrt(hidden_size)
-        # The normalizer's data type should be downcasted to the model's
-        # data type such as bfloat16, not float32.
-        normalizer = self.config.hidden_size**0.5
-        self.register_buffer("normalizer", torch.tensor(normalizer))
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -477,9 +474,6 @@ class Gemma3TextModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        hidden_states *= self.normalizer
-
-        residual = None
 
         positions = einops.rearrange(positions, "s -> 1 s")
 
@@ -490,12 +484,11 @@ class Gemma3TextModel(nn.Module):
         for i in range(min(self.config.num_hidden_layers, len(self.layers))):
             layer = self.layers[i]
             layer_outputs = layer(
-                positions,
+                positions=positions,
                 position_embeddings_global=position_embeddings_global,
                 position_embeddings_local=position_embeddings_local,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
-                residual=residual,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
@@ -672,3 +665,4 @@ class Gemma3ForCausalLM(nn.Module):
 
 
 EntryClass = Gemma3ForCausalLM
+AutoModel.register(Gemma3TextConfig, Gemma3ForCausalLM, exist_ok=True)

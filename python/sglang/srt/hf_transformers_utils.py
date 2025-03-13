@@ -38,6 +38,7 @@ from sglang.srt.configs import (
     MultiModalityConfig,
     Qwen2_5_VLConfig,
 )
+from sglang.srt.configs.gemma3 import Gemma3TextConfig
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -46,6 +47,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     # Qwen2_5_VLConfig.model_type: Qwen2_5_VLConfig,
     MultiModalityConfig.model_type: MultiModalityConfig,
     Gemma3Config.model_type: Gemma3Config,
+    Gemma3TextConfig.model_type: Gemma3TextConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():

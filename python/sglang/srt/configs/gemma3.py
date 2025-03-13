@@ -205,6 +205,7 @@ class Gemma3TextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -231,6 +232,10 @@ class Gemma3TextConfig(PretrainedConfig):
         self.sliding_window_pattern = sliding_window_pattern
         self.rope_scaling = rope_scaling
         rope_config_validation(self)
+
+        print(f"1 text config: {self.eos_token_id}")
+        print(f"2 text config: {self.bos_token_id}")
+        print(f"3 text config: {self.pad_token_id}")
 
 
 class Gemma3Config(PretrainedConfig):
@@ -303,7 +308,7 @@ class Gemma3Config(PretrainedConfig):
         if text_config is None:
             text_config = Gemma3TextConfig()
             logger.info(
-                "text_config is None, using default Gemma3TextConfig vision config."
+                "text_config is None, using default Gemma3TextConfig vision configaaa."
             )
         elif isinstance(text_config, dict):
             text_config = Gemma3TextConfig(**text_config)
@@ -313,9 +318,12 @@ class Gemma3Config(PretrainedConfig):
         else:
             vision_config = SiglipVisionConfig()
             logger.info(
-                "vision_config is None or incompatible with Gemma3VisionConfig intialization. Gemma3 will be limited "
+                "vision_config is None or incompatible with Gemma3VisionConfig intiialization. Gemma3 will be limited "
                 "to text tasks."
             )
+
+        print(f"text_config: {text_config}")
+        print(f"vision_config: {vision_config}")
 
         self.text_config = text_config
         self.vision_config = vision_config

@@ -160,7 +160,7 @@ class TestOpenAIVisionServer(unittest.TestCase):
                         {
                             "type": "text",
                             "text": "I have two very different images. They are not related at all. "
-                            "Please describe the first image in one sentence, and then describe the second image in another sentence.",
+                                    "Please describe the first image in one sentence, and then describe the second image in another sentence.",
                         },
                     ],
                 },
@@ -547,7 +547,10 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trust-remote-code", "--chat-template", "gemma-it"],
+            other_args=["--trust-remote-code", "--chat-template", "gemma-it",
+
+                        # "--disable-cuda-graph"
+                        ],
         )
         cls.base_url += "/v1"
 

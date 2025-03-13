@@ -950,6 +950,7 @@ def v1_chat_generate_request(
             else:
                 conv = generate_chat_conv(request, chat_template_name)
                 prompt = conv.get_prompt()
+                print(f"prompt: {prompt}")
                 image_data = conv.image_data
                 modalities = conv.modalities
                 stop = conv.stop_str or []

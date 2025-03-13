@@ -19,7 +19,6 @@ import dataclasses
 from enum import IntEnum, auto
 from typing import Dict, List, Optional, Tuple, Union
 
-from sglang.lang.chat_template import ChatTemplateStyle
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 
 
@@ -46,6 +45,7 @@ class SeparatorStyle(IntEnum):
     DEEPSEEK_CHAT = auto()
     METAMATH = auto()
     QWEN2_VL_EMBED = auto()
+    GEMMA3 = auto()
 
 
 @dataclasses.dataclass
@@ -286,6 +286,20 @@ class Conversation:
                 else:
                     ret += role + ":"
             return ret
+        elif self.sep_style == SeparatorStyle.GEMMA3:
+            print(self.messages)
+            ret = system_prompt
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    if i == 0:
+                        ret += message + self.sep
+                    else:
+                        ret += role + message + self.sep
+                else:
+                    ret += role
+            return ret
+
+
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -312,7 +326,7 @@ class Conversation:
     def to_gradio_chatbot(self):
         """Convert the conversation to gradio chatbot format."""
         ret = []
-        for i, (role, msg) in enumerate(self.messages[self.offset :]):
+        for i, (role, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
                 ret.append([msg, None])
             else:
@@ -326,7 +340,7 @@ class Conversation:
         else:
             ret = [{"role": "system", "content": self.system_message}]
 
-        for i, (_, msg) in enumerate(self.messages[self.offset :]):
+        for i, (_, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
                 ret.append({"role": "user", "content": msg})
             else:
@@ -548,7 +562,7 @@ register_conv_template(
     Conversation(
         name="vicuna_v1.1",
         system_message="A chat between a curious user and an artificial intelligence assistant. "
-        "The assistant gives helpful, detailed, and polite answers to the user's questions.",
+                       "The assistant gives helpful, detailed, and polite answers to the user's questions.",
         roles=("USER", "ASSISTANT"),
         sep_style=SeparatorStyle.ADD_COLON_TWO,
         sep=" ",
@@ -610,18 +624,12 @@ register_conv_template(
     Conversation(
         name="gemma-it",
         system_message="You are a helpful assistant.",
-        system_template="<|im_start|>system\n{system_message}",
-        roles=("<|im_start|>user", "<|im_start|>assistant"),
-        sep="<|im_end|>\n",
-        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
-        stop_str=["<|im_end|>"],
-        # role_prefix_and_suffix={
-        #     "system": ("", ""),
-        #     "user": ("<start_of_turn>user\n", "<end_of_turn>\n"),
-        #     "assistant": ("<start_of_turn>model\n", "<end_of_turn>\n"),
-        # },
-        # style=ChatTemplateStyle.PLAIN,
-        image_token="<image_soft_token>",
+        system_template="<bos><start_of_turn>user\n{system_message}\n\n",
+        roles=("<start_of_turn>user", "<start_of_turn>model"),
+        sep="<end_of_turn>\n",
+        sep_style=SeparatorStyle.GEMMA3,
+        stop_str=["<end_of_turn>"],
+        image_token="<start_of_image>",
     )
 )
 
