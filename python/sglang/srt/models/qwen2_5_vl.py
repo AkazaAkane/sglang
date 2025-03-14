@@ -732,4 +732,4 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]
-AutoModel.register(Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration)
+# AutoModel.register(Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration)
