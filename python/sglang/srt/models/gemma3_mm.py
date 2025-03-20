@@ -218,7 +218,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         # Create attention masks
         global_attn_masks = []
         local_attn_masks = []
-        sliding_window = self.config.text_config.interleaved_sliding_window
+        sliding_window = self.config.text_config.sliding_window
 
         start_idx = 0
         for seq_len in seq_lens:
@@ -247,11 +247,14 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             global_attn_masks.append(global_attn_mask)
 
             # Create local causal mask with sliding window
-            local_attn_mask = torch.ones_like(global_attn_mask)
-            local_attn_mask = torch.tril(local_attn_mask, diagonal=-sliding_window)
-            local_attn_mask = torch.where(
-                local_attn_mask == 0, global_attn_mask, float("-inf")
-            )
+            local_attn_mask = torch.clone(global_attn_mask)
+            if sliding_window is not None and sliding_window > 0:
+                # Apply the sliding window limit - prevent attending to tokens more than sliding_window away
+                window_mask = torch.ones_like(global_attn_mask)
+                window_mask = torch.triu(window_mask, diagonal=-sliding_window + 1)
+                local_attn_mask = torch.where(
+                    window_mask == 1, float("-inf"), local_attn_mask
+                )
             local_attn_masks.append(local_attn_mask)
 
         kwargs["global_attn_masks"] = global_attn_masks
@@ -405,6 +408,15 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         else:
             llm_input_ids.clamp_(min=0, max=self.vocab_size - 1)
             inputs_embeds = self.get_input_embeddings()(llm_input_ids)
+
+        # Prepare attention masks with correct sliding window parameter
+        attention_masks = self.prepare_attn_masks(
+            input_ids=input_ids,
+            positions=positions,
+            mask_dtype=self.language_model.dtype(),
+            **kwargs
+        )
+        kwargs.update(attention_masks)
 
         outputs = self.language_model(
             input_ids=None,

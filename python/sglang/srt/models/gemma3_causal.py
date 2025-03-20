@@ -171,8 +171,6 @@ class Gemma3Attention(nn.Module):
             # Local attention. Override the values in config.json.
             self.rope_theta = config.rope_local_base_freq
             self.rope_scaling = {"rope_type": "default"}
-            # FIXME(mick): idk why vllm does this
-            # self.sliding_window = config.interleaved_sliding_window
             self.sliding_window = config.sliding_window
         else:
             # Global attention. Use the values in config.json.
@@ -372,7 +370,15 @@ class Gemma3RotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
+        # Apply the rope_scaling_factor if it exists in the config
+        # This is critical for long sequence handling
+        self.rope_scaling_factor = getattr(config, "rope_scaling_factor", 1)
+        
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        # Apply the scaling factor to inverse frequencies
+        if self.rope_scaling_factor != 1:
+            inv_freq = inv_freq / self.rope_scaling_factor
+            
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
