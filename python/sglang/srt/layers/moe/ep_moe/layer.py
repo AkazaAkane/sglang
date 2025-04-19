@@ -847,8 +847,13 @@ class DeepEPMoE(EPMoE):
     ):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
-            return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
+            # For prefill (large batch), use the normal dispatcher but with contiguous GEMM
+            if forward_mode == ForwardMode.PREFILL and use_deep_gemm:
+                return self.forward_deepgemm_contiguous(hidden_states, seg_indptr)
+            else:
+                return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         elif resolved_deepep_mode == DeepEPMode.low_latency:
+            # Low latency mode always uses masked GEMM
             return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
@@ -968,24 +973,39 @@ class DeepEPMoE(EPMoE):
 
     def forward_deepgemm_contiguous(
         self,
-        hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
-        reorder_topk_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
         seg_indptr: torch.Tensor,
     ):
-        """Forward pass using DeepEP with contiguous layout GEMM optimization."""
+        """Forward pass using normal dispatcher but with contiguous GEMM optimization."""
         assert self.quant_method is not None
         assert self.activation == "silu"
-
-        # 1. Gather expert-major matrix (already done by dispatcher)
-        A, A_scale = hidden_states_fp8        # shapes [M_sum, K] and [M_sum, K/128]
-        M_sum, K = A.shape
+        
+        # Quantize input if needed
+        if self.use_fp8_w8a8:
+            if self.activation_scheme == "dynamic" and not self.use_block_quant:
+                max_value = torch.max(hidden_states).repeat(self.num_experts_per_partition).to(torch.float32)
+                self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+                
+            if self.block_shape is not None:
+                from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+                hidden_states_fp8, scale = per_token_group_quant_fp8(hidden_states, self.block_shape[1])
+            else:
+                # Tensor-wise quantization
+                hidden_states_fp8 = torch.empty_like(hidden_states, dtype=self.fp8_dtype)
+                for i in range(hidden_states.shape[0]):
+                    hidden_states_fp8[i] = (hidden_states[i] / self.w13_input_scale).to(self.fp8_dtype)
+                scale = self.w13_input_scale
+        else:
+            hidden_states_fp8, scale = hidden_states, None
+        
+        # 1. Use existing seg_indptr from dispatcher
         E = seg_indptr.numel() - 1
         align_M = get_m_alignment_for_contiguous_layout()   # 128 today
-
+        
         # 2. Pad each expert to alignment boundary => build m_indices
         pad_rows = []
-        m_indices = torch.empty(M_sum + E * (align_M-1), dtype=torch.int32,
-                              device=A.device)
+        m_indices = torch.empty(hidden_states.shape[0] + E * (align_M-1), dtype=torch.int32,
+                              device=hidden_states.device)
         cursor = 0
         for e in range(E):
             beg, end = seg_indptr[e].item(), seg_indptr[e+1].item()
@@ -997,20 +1017,25 @@ class DeepEPMoE(EPMoE):
             cursor += padded
         m_indices = m_indices[:cursor]   # trim extra capacity
         
-        # cat zero-rows for padding so A stays contiguous
+        # cat zero-rows for padding so input stays contiguous
         if pad_rows:
-            pad_tensor = torch.zeros(sum(p for _,p in pad_rows), K,
-                                   dtype=A.dtype, device=A.device)
-            pad_scale = torch.zeros_like(pad_tensor[..., : (K+127)//128 ])
-            A = torch.cat([A, pad_tensor], dim=0)
-            A_scale = torch.cat([A_scale, pad_scale], dim=0)
-
+            pad_tensor = torch.zeros(sum(p for _,p in pad_rows), hidden_states.shape[1],
+                                   dtype=hidden_states_fp8.dtype, device=hidden_states.device)
+            if scale is not None:
+                pad_scale = torch.zeros_like(scale.expand(pad_tensor.shape[0], -1))
+                scale = torch.cat([scale, pad_scale], dim=0)
+            hidden_states_fp8 = torch.cat([hidden_states_fp8, pad_tensor], dim=0)
+        
         # 3. First GEMM (w1+w3)
-        gateup_output = torch.empty((A.shape[0], self.w13_weight.shape[1]),
-                                device=A.device, dtype=torch.bfloat16)
+        gateup_output = torch.empty((hidden_states_fp8.shape[0], self.w13_weight.shape[1]),
+                                device=hidden_states.device, dtype=torch.bfloat16)
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            (A, A_scale), self.w13_weight_fp8, gateup_output, m_indices)
-
+            (hidden_states_fp8, scale) if scale is not None else hidden_states_fp8, 
+            self.w13_weight_fp8, 
+            gateup_output, 
+            m_indices
+        )
+        
         # 4. Activation + quantization for second GEMM
         scale_block_size = 128
         down_input = torch.empty(
@@ -1024,7 +1049,7 @@ class DeepEPMoE(EPMoE):
             dtype=torch.float32,
         )
         
-        # Use the same activation function as in masked version
+        # Use the activation function
         silu_and_mul_masked_post_quant_fwd(
             gateup_output,
             down_input,
@@ -1032,20 +1057,21 @@ class DeepEPMoE(EPMoE):
             scale_block_size,
             None,  # No mask needed for contiguous version
         )
-
+        
         # 5. Second GEMM (w2)
         down_input_fp8 = (
             down_input,
             get_col_major_tma_aligned_tensor(down_input_scale),
         )
         down_output = torch.empty(
-            (A.shape[0], self.w2_weight.shape[1]),
-            device=A.device, 
+            (hidden_states_fp8.shape[0], self.w2_weight.shape[1]),
+            device=hidden_states.device, 
             dtype=torch.bfloat16
         )
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            down_input_fp8, self.w2_weight_fp8, down_output, m_indices)
-
+            down_input_fp8, self.w2_weight_fp8, down_output, m_indices
+        )
+        
         return down_output
 
     def forward_deepgemm_masked(
