@@ -7,7 +7,9 @@ from torch.nn import Module
 try:
     from deep_gemm import (
         get_col_major_tma_aligned_tensor,
+        get_m_alignment_for_contiguous_layout,
         m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
     )
 
     use_deep_gemm = True
@@ -962,6 +964,88 @@ class DeepEPMoE(EPMoE):
                 ),
                 block_shape=self.block_shape,
             )
+        return down_output
+
+    def forward_deepgemm_contiguous(
+        self,
+        hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor],
+        reorder_topk_ids: torch.Tensor,
+        seg_indptr: torch.Tensor,
+    ):
+        """Forward pass using DeepEP with contiguous layout GEMM optimization."""
+        assert self.quant_method is not None
+        assert self.activation == "silu"
+
+        # 1. Gather expert-major matrix (already done by dispatcher)
+        A, A_scale = hidden_states_fp8        # shapes [M_sum, K] and [M_sum, K/128]
+        M_sum, K = A.shape
+        E = seg_indptr.numel() - 1
+        align_M = get_m_alignment_for_contiguous_layout()   # 128 today
+
+        # 2. Pad each expert to alignment boundary => build m_indices
+        pad_rows = []
+        m_indices = torch.empty(M_sum + E * (align_M-1), dtype=torch.int32,
+                              device=A.device)
+        cursor = 0
+        for e in range(E):
+            beg, end = seg_indptr[e].item(), seg_indptr[e+1].item()
+            length = end - beg
+            padded = ((length + align_M - 1) // align_M) * align_M
+            m_indices[cursor:cursor+padded].fill_(e)
+            if padded != length:
+                pad_rows.append((cursor+length, padded-length))
+            cursor += padded
+        m_indices = m_indices[:cursor]   # trim extra capacity
+        
+        # cat zero-rows for padding so A stays contiguous
+        if pad_rows:
+            pad_tensor = torch.zeros(sum(p for _,p in pad_rows), K,
+                                   dtype=A.dtype, device=A.device)
+            pad_scale = torch.zeros_like(pad_tensor[..., : (K+127)//128 ])
+            A = torch.cat([A, pad_tensor], dim=0)
+            A_scale = torch.cat([A_scale, pad_scale], dim=0)
+
+        # 3. First GEMM (w1+w3)
+        gateup_output = torch.empty((A.shape[0], self.w13_weight.shape[1]),
+                                device=A.device, dtype=torch.bfloat16)
+        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            (A, A_scale), self.w13_weight_fp8, gateup_output, m_indices)
+
+        # 4. Activation + quantization for second GEMM
+        scale_block_size = 128
+        down_input = torch.empty(
+            (gateup_output.shape[0], gateup_output.shape[1] // 2),
+            device=gateup_output.device,
+            dtype=self.fp8_dtype,
+        )
+        down_input_scale = torch.empty(
+            (gateup_output.shape[0], (gateup_output.shape[1] // 2) // scale_block_size),
+            device=gateup_output.device,
+            dtype=torch.float32,
+        )
+        
+        # Use the same activation function as in masked version
+        silu_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            scale_block_size,
+            None,  # No mask needed for contiguous version
+        )
+
+        # 5. Second GEMM (w2)
+        down_input_fp8 = (
+            down_input,
+            get_col_major_tma_aligned_tensor(down_input_scale),
+        )
+        down_output = torch.empty(
+            (A.shape[0], self.w2_weight.shape[1]),
+            device=A.device, 
+            dtype=torch.bfloat16
+        )
+        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            down_input_fp8, self.w2_weight_fp8, down_output, m_indices)
+
         return down_output
 
     def forward_deepgemm_masked(

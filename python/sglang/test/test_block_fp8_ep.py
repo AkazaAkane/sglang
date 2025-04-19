@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, use_deep_gemm
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.test.test_utils import CustomTestCase
 
@@ -355,6 +356,152 @@ class TestW8A8BlockFP8EPMoE(CustomTestCase):
                 seed=params[8],
             ):
                 self._w8a8_block_fp8_ep_moe(*params)
+            torch.cuda.empty_cache()
+
+
+class TestDeepEPMoEContiguous(CustomTestCase):
+    """Test the contiguous forward method of DeepEPMoE."""
+    
+    # Test with smaller sizes for regular testing
+    DTYPES = [torch.bfloat16]
+    M = [64, 128, 512]
+    N = [128, 256]
+    K = [256, 4096]
+    E = [8, 24]
+    TOP_KS = [2, 4]
+    BLOCK_SIZE = [[128, 128]]
+    SEEDS = [0]
+    
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        if not use_deep_gemm:
+            raise unittest.SkipTest("deep_gemm is not available")
+        torch.set_default_device("cuda")
+    
+    def _test_deepep_contiguous(self, M, N, K, E, topk, block_size, dtype, seed):
+        """Test DeepEPMoE contiguous forward against normal forward."""
+        torch.manual_seed(seed)
+        
+        # Set up scaling factor to avoid overflow
+        factor_for_scale = 1e-2
+        fp8_info = torch.finfo(torch.float8_e4m3fn)
+        fp8_max, fp8_min = fp8_info.max, fp8_info.min
+        
+        # Create input tensor
+        hidden_states = torch.randn((M, K), dtype=dtype) / 10
+        
+        # Create expert weights
+        w13_fp32 = (torch.rand((E, 2 * N, K), dtype=torch.float32) - 0.5) * 2 * fp8_max
+        w13 = w13_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+        
+        w2_fp32 = (torch.rand((E, K, N), dtype=torch.float32) - 0.5) * 2 * fp8_max
+        w2 = w2_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+        
+        # Create block-wise scales
+        block_n, block_k = block_size[0], block_size[1]
+        n_tiles_w13 = (2 * N + block_n - 1) // block_n
+        n_tiles_w2 = (K + block_n - 1) // block_n
+        k_tiles_w13 = (K + block_k - 1) // block_k
+        k_tiles_w2 = (N + block_k - 1) // block_k
+        
+        w13_scale = torch.rand((E, n_tiles_w13, k_tiles_w13), dtype=torch.float32) * factor_for_scale
+        w2_scale = torch.rand((E, n_tiles_w2, k_tiles_w2), dtype=torch.float32) * factor_for_scale
+        
+        # Create router logits
+        router_logits = torch.randn((M, E), dtype=dtype)
+        
+        # Create DeepEPMoE instance
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        from sglang.srt.utils import DeepEPMode
+        
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=block_size,
+            activation_scheme="dynamic"
+        )
+        
+        moe = DeepEPMoE(
+            num_experts=E,
+            top_k=topk,
+            hidden_size=K,
+            intermediate_size=N,
+            params_dtype=dtype,
+            quant_config=quant_config,
+            activation="silu",
+            deepep_mode=DeepEPMode.low_latency
+        )
+        
+        # Set weights manually
+        moe.w13_weight.data = w13
+        moe.w2_weight.data = w2
+        moe.w13_weight_scale_inv.data = w13_scale
+        moe.w2_weight_scale_inv.data = w2_scale
+        
+        # Get topk experts
+        topk_weights, topk_ids = select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=topk,
+            renormalize=False
+        )
+        
+        # Prepare inputs for normal forward
+        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(topk_ids, E)
+        
+        # Prepare inputs for contiguous forward
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+        hidden_states_fp8, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        
+        with torch.inference_mode():
+            # Run normal forward
+            normal_output = moe.forward_normal(
+                hidden_states=hidden_states_fp8,
+                reorder_topk_ids=reorder_topk_ids,
+                seg_indptr=seg_indptr
+            )
+            
+            # Run contiguous forward
+            contiguous_output = moe.forward_deepgemm_contiguous(
+                hidden_states_fp8=(hidden_states_fp8, scale),
+                reorder_topk_ids=reorder_topk_ids,
+                seg_indptr=seg_indptr
+            )
+        
+        # Compare outputs
+        normal_output = normal_output.to(torch.float32)
+        contiguous_output = contiguous_output.to(torch.float32)
+        
+        # Calculate relative error
+        rel_error = torch.mean(torch.abs(contiguous_output - normal_output)) / (torch.mean(torch.abs(normal_output)) + 1e-6)
+        
+        # Assert that the relative error is small
+        self.assertTrue(rel_error < 0.05, f"Relative error {rel_error} is too large")
+    
+    def test_deepep_contiguous(self):
+        """Run tests with different parameters."""
+        for params in itertools.product(
+            self.M,
+            self.N,
+            self.K,
+            self.E,
+            self.TOP_KS,
+            self.BLOCK_SIZE,
+            self.DTYPES,
+            self.SEEDS,
+        ):
+            with self.subTest(
+                M=params[0],
+                N=params[1],
+                K=params[2],
+                E=params[3],
+                topk=params[4],
+                block_size=params[5],
+                dtype=params[6],
+                seed=params[7],
+            ):
+                self._test_deepep_contiguous(*params)
             torch.cuda.empty_cache()
 
 
