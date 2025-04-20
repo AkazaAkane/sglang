@@ -976,7 +976,6 @@ class DeepEPMoE(EPMoE):
         hidden_states: torch.Tensor,
         seg_indptr: torch.Tensor,
         reorder_topk_ids: torch.Tensor = None,
-        topk_weights: torch.Tensor = None,
     ):
         """Forward pass using normal dispatcher but with contiguous GEMM optimization."""
         assert self.quant_method is not None
