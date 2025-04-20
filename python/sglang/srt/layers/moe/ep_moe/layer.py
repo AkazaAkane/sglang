@@ -975,34 +975,34 @@ class DeepEPMoE(EPMoE):
         self,
         hidden_states: torch.Tensor,
         seg_indptr: torch.Tensor,
+        reorder_topk_ids: torch.Tensor = None,
+        topk_weights: torch.Tensor = None,
     ):
         """Forward pass using normal dispatcher but with contiguous GEMM optimization."""
         assert self.quant_method is not None
         assert self.activation == "silu"
         
-        # Quantize input if needed
-        if self.use_fp8_w8a8:
-            if self.activation_scheme == "dynamic" and not self.use_block_quant:
-                max_value = torch.max(hidden_states).repeat(self.num_experts_per_partition).to(torch.float32)
-                self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
-                
-            if self.block_shape is not None:
-                from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-                hidden_states_fp8, scale = per_token_group_quant_fp8(hidden_states, self.block_shape[1])
-            else:
-                # Tensor-wise quantization
-                hidden_states_fp8 = torch.empty_like(hidden_states, dtype=self.fp8_dtype)
-                for i in range(hidden_states.shape[0]):
-                    hidden_states_fp8[i] = (hidden_states[i] / self.w13_input_scale).to(self.fp8_dtype)
-                scale = self.w13_input_scale
-        else:
-            hidden_states_fp8, scale = hidden_states, None
+        # Only use DeepGEMM contiguous path when FP8 quantization is enabled
+        if not self.use_fp8_w8a8:
+            return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
         
-        # 1. Use existing seg_indptr from dispatcher
+        # Quantize input
+        if self.activation_scheme == "dynamic" and not self.use_block_quant:
+            max_value = torch.max(hidden_states).repeat(self.num_experts_per_partition).to(torch.float32)
+            self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+            
+        if self.block_shape is not None:
+            from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+            hidden_states_fp8, scale = per_token_group_quant_fp8(hidden_states, self.block_shape[1])
+        else:
+            hidden_states_fp8 = torch.empty_like(hidden_states, dtype=self.fp8_dtype)
+            scale = torch.empty(hidden_states.shape[0], 1, dtype=torch.float32, device=hidden_states.device)
+            for i in range(hidden_states.shape[0]):
+                hidden_states_fp8[i], scale[i, 0] = scaled_fp8_quant(hidden_states[i])
+        
         E = seg_indptr.numel() - 1
         align_M = get_m_alignment_for_contiguous_layout()   # 128 today
         
-        # 2. Pad each expert to alignment boundary => build m_indices
         pad_rows = []
         m_indices = torch.empty(hidden_states.shape[0] + E * (align_M-1), dtype=torch.int32,
                               device=hidden_states.device)
@@ -1022,21 +1022,25 @@ class DeepEPMoE(EPMoE):
             pad_tensor = torch.zeros(sum(p for _,p in pad_rows), hidden_states.shape[1],
                                    dtype=hidden_states_fp8.dtype, device=hidden_states.device)
             if scale is not None:
-                pad_scale = torch.zeros_like(scale.expand(pad_tensor.shape[0], -1))
+                # Create pad_scale with proper shape
+                pad_scale = torch.zeros_like(scale[:1]).expand(sum(p for _,p in pad_rows), -1).clone()
                 scale = torch.cat([scale, pad_scale], dim=0)
             hidden_states_fp8 = torch.cat([hidden_states_fp8, pad_tensor], dim=0)
         
-        # 3. First GEMM (w1+w3)
+        # TMA align the scale
+        scale = get_col_major_tma_aligned_tensor(scale)
+        
+        # First GEMM (w1+w3)
         gateup_output = torch.empty((hidden_states_fp8.shape[0], self.w13_weight.shape[1]),
                                 device=hidden_states.device, dtype=torch.bfloat16)
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            (hidden_states_fp8, scale) if scale is not None else hidden_states_fp8, 
+            (hidden_states_fp8, scale), 
             self.w13_weight_fp8, 
             gateup_output, 
             m_indices
         )
         
-        # 4. Activation + quantization for second GEMM
+        # Activation + quantization for second GEMM
         scale_block_size = 128
         down_input = torch.empty(
             (gateup_output.shape[0], gateup_output.shape[1] // 2),
@@ -1049,16 +1053,18 @@ class DeepEPMoE(EPMoE):
             dtype=torch.float32,
         )
         
-        # Use the activation function
+        # Create dummy masked_m for safety
+        dummy_mask = torch.zeros(1, dtype=torch.int32, device=hidden_states.device)
+        
         silu_and_mul_masked_post_quant_fwd(
             gateup_output,
             down_input,
             down_input_scale,
             scale_block_size,
-            None,  # No mask needed for contiguous version
+            dummy_mask,  # Pass dummy mask
         )
         
-        # 5. Second GEMM (w2)
+        # Second GEMM (w2)
         down_input_fp8 = (
             down_input,
             get_col_major_tma_aligned_tensor(down_input_scale),
