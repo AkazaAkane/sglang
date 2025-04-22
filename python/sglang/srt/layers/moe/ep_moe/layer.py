@@ -10,6 +10,7 @@ try:
         get_col_major_tma_aligned_tensor,
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
         m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+        get_m_alignment_for_contiguous_layout,
     )
     from sgl_kernel import silu_and_mul
 
@@ -1004,6 +1005,21 @@ class DeepEPMoE(EPMoE):
         all_tokens = sum(num_recv_tokens_per_expert)
         if all_tokens <= 0:
             return hidden_states_fp8
+            
+        # Ensure M-alignment with 128 (DeepGEMM's requirement)
+        try:
+            m_alignment = get_m_alignment_for_contiguous_layout()
+        except ImportError:
+            m_alignment = 128  # Default alignment for DeepGEMM
+            
+        # Calculate padding needed to meet alignment requirements
+        padding_tokens = 0
+        if all_tokens % m_alignment != 0:
+            padding_tokens = m_alignment - (all_tokens % m_alignment)
+            all_tokens_aligned = all_tokens + padding_tokens
+        else:
+            all_tokens_aligned = all_tokens
+            
         num_groups, M, K = hidden_states_fp8[0].size()
         N = self.w13_weight.size(1)
         scale_block_size = 128
@@ -1016,19 +1032,28 @@ class DeepEPMoE(EPMoE):
 
         input_tensor = [
             torch.empty(
-                (all_tokens, K),
+                (all_tokens_aligned, K),
                 device=hidden_states_fp8[0].device,
                 dtype=hidden_states_fp8[0].dtype,
             ),
             torch.empty(
-                (all_tokens, K // 128),
+                (all_tokens_aligned, K // 128),
                 device=hidden_states_fp8[0].device,
                 dtype=torch.float32,
             ),
         ]
+        # Zero-initialize padded region if padding was needed
+        if padding_tokens > 0:
+            input_tensor[0][all_tokens:].zero_()
+            input_tensor[1][all_tokens:].zero_()
+            
         m_indices = torch.empty(
-            all_tokens, device=hidden_states_fp8[0].device, dtype=torch.int32
+            all_tokens_aligned, device=hidden_states_fp8[0].device, dtype=torch.int32
         )
+        # Set indices for padding tokens to the last expert (or any fixed value)
+        if padding_tokens > 0:
+            m_indices[all_tokens:] = 0
+            
         output_index = torch.empty_like(topk_idx)
 
         num_recv_tokens_per_expert_gpu = torch.tensor(
@@ -1045,24 +1070,33 @@ class DeepEPMoE(EPMoE):
             topk_idx,
             num_recv_tokens_per_expert_gpu,
             expert_start_loc,
-            input_tensor[0],
-            input_tensor[1],
-            m_indices,
+            input_tensor[0][:all_tokens],  # Only scatter to the non-padded region
+            input_tensor[1][:all_tokens],  # Only scatter to the non-padded region
+            m_indices[:all_tokens],        # Only scatter to the non-padded region
             output_index,
         )
 
+        # If we have padding, we need to ensure padded tokens have valid m_indices
+        if padding_tokens > 0:
+            # Set padded tokens to use expert 0 (or another valid expert)
+            # We're using 0 to minimize impact, but any valid expert index would work
+            last_expert_id = 0
+            m_indices[all_tokens:] = last_expert_id
+
         gateup_output = torch.empty(
-            (all_tokens, N),
+            (all_tokens_aligned, N),
             device=hidden_states_fp8[0].device,
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
+        
+        # Execute the forward GEMM with the padded tensors
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             input_tensor, self.w13_weight_fp8, gateup_output, m_indices
         )
         down_input = torch.empty(
             (
-                all_tokens,
+                all_tokens_aligned,
                 N // 2,
             ),
             device=gateup_output.device,
@@ -1070,7 +1104,7 @@ class DeepEPMoE(EPMoE):
         )
         down_input_scale = torch.empty(
             (
-                all_tokens,
+                all_tokens_aligned,
                 N // 2,
             ),
             device=gateup_output.device,
@@ -1078,7 +1112,7 @@ class DeepEPMoE(EPMoE):
         )
         silu_and_mul(gateup_output.view(-1, N), down_input)
         down_output = torch.empty(
-            (all_tokens, K),
+            (all_tokens_aligned, K),
             device=hidden_states_fp8[0].device,
             dtype=torch.bfloat16,
         )
@@ -1093,7 +1127,8 @@ class DeepEPMoE(EPMoE):
             m_indices,
         )
 
-        ep_gather(down_output, topk_idx, topk_weights, output_index, gather_out)
+        # Only gather from the non-padded region for the final result
+        ep_gather(down_output[:all_tokens], topk_idx, topk_weights, output_index, gather_out)
 
         return gather_out
 
