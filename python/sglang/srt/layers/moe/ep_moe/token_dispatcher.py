@@ -26,6 +26,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
+    ep_gather,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -366,7 +367,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # TODO support deepgemm
         previous_event = Buffer.capture() if self.async_finish else None
         if _enable_jit_deepgemm:
-            return hidden_states, previous_event
+            if hidden_states.dtype == torch.float8_e4m3fn:
+                output = torch.zeros(
+                    (topk_idx.shape[0], hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=torch.bfloat16,  # Or use a parameter to determine output dtype
+                )
+                return (hidden_states, output, topk_idx, topk_weights), previous_event
+            else:
+                return hidden_states, previous_event
         else:
             if hidden_states.shape[0] > 0:
                 num_tokens = self.src2dst.shape[0] // self.router_topk
@@ -392,10 +401,26 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     dtype=hidden_states.dtype,
                 )
 
-        return output, previous_event
+            return output, previous_event
 
     def combine_b(self, output, previous_event):
-        hidden_states, event = self._combine_core(output, previous_event)
+        if _enable_jit_deepgemm and isinstance(output, tuple) and len(output) == 4:
+            # Handling the DeepGEMM case
+            hidden_states, output_buffer, topk_idx, topk_weights = output
+            output_index = torch.empty_like(topk_idx)
+            
+            ep_gather(
+                hidden_states, 
+                topk_idx, 
+                topk_weights, 
+                output_index, 
+                output_buffer
+            )
+            
+            hidden_states, event = self._combine_core(output_buffer, previous_event)
+        else:
+            hidden_states, event = self._combine_core(output, previous_event)
+            
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
         self.src2dst = None
